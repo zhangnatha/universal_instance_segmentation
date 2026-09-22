@@ -513,6 +513,18 @@ scripts\package_cpp.bat
 * **`[image_stem].json`**：标准化目标检测与实例分割预测文件，包含图像宽高尺寸、目标框坐标、分类类别名称、置信度得分及 Run-Length Encoding (RLE) 掩膜编码数据，可直接无缝接入第 8 节 `compare_json` 执行精度评测。
 * **`[image_stem]_vis.jpg`**：实例分割可视化叠加渲染图，按类别调色板半透明填充掩膜（Alpha=0.40）、绘制多边形轮廓边缘、外接矩形框及带有类别名与分值的标签横条，便于直观核对质检。
 
+### 7.5 推理结果转换为 LabelMe 格式
+
+使用 `scripts/convert_to_labelme.py` 可将单个推理 JSON 或目录当前层级的全部 `*.json`（不递归子目录）转换为 LabelMe / X-AnyLabeling 标注格式。以下命令以 RF-DETR Python 推理结果为例，将转换后的 JSON 写入独立目录，避免覆盖原始预测结果。请在仓库根目录执行：
+
+```bash
+python scripts/convert_to_labelme.py \
+  --input results/pred_python_rfdetr \
+  --output-dir results/pred_python_rfdetr_labelme
+```
+
+`--input` 也可以直接指定单个 JSON 文件；`--output-dir` 省略时会原地覆盖输入文件，如需原地转换并保留备份，可同时添加 `--backup`。脚本只转换 JSON，不复制图片。生成的 LabelMe JSON 中 `imagePath` 使用推理 JSON 的 `file` 或 `image` 字段的文件名，`imageData` 为空，因此用 Labelme 打开时需将对应原图放在 `results/pred_python_rfdetr_labelme/` 下，或确保该相对路径能够找到原图。转换前请确认已安装脚本依赖（至少 OpenCV 与 NumPy）。
+
 ---
 
 ## 8. 模型评估与分析报告 (LabelMe 真值对标)
