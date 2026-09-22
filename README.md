@@ -52,6 +52,8 @@
 
 要求 Python >= 3.10，推荐使用 Conda 虚拟环境：
 
+> Ubuntu 18.04 请使用下面的 [2.1.1 Ubuntu 18.04 安装](#211-ubuntu-1804-安装)完整流程，不要与本节的通用流程叠加执行。
+
 ```bash
 git clone https://github.com/zhangnatha/universal_instance_segmentation.git
 cd universal_instance_segmentation
@@ -71,6 +73,44 @@ pip install -e '.[rfdetr]'                                     # RF-DETR
 
 # 或者一键安装全部依赖
 pip install -e '.[all]'
+```
+
+### 2.1.1 Ubuntu 18.04 安装
+
+Ubuntu 18.04 请使用 Conda 创建 Python 3.10 环境，并按以下固定版本流程安装。若尚未获取仓库，先执行以下命令；已有仓库则直接进入仓库根目录。根据实际环境选择 CUDA 11.8、CUDA 12.1 或纯 CPU 中的一种 PyTorch 安装方式；下面默认启用 CUDA 11.8，选择其他方式时注释该行并取消对应命令的注释。
+
+```bash
+git clone https://github.com/zhangnatha/universal_instance_segmentation.git
+cd universal_instance_segmentation
+
+conda create -n uiseg python=3.10 -y
+conda activate uiseg
+
+conda install -c conda-forge gcc_linux-64=9 gxx_linux-64=9 -y
+
+# CUDA 11.8
+pip install torch==2.5.0 torchvision==0.20.0 --index-url https://download.pytorch.org/whl/cu118
+
+# CUDA 12.1
+# pip install torch==2.5.0 torchvision==0.20.0 --index-url https://download.pytorch.org/whl/cu121
+
+# 纯 CPU 测试
+# pip install torch==2.5.0 torchvision==0.20.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Detectron2 v0.6
+pip install --no-build-isolation "git+https://github.com/facebookresearch/detectron2.git@v0.6"
+
+# 额外二进制依赖
+pip install -i https://pypi.org/simple --only-binary=:all: pyarrow libcst wandb "av>=14.2,<16"
+
+# 安装项目及全部可选依赖
+pip install -e '.[all]'
+
+# 验证
+python -c "
+import torch, torchvision, detectron2
+print('PyTorch:', torch.__version__, '| CUDA available:', torch.cuda.is_available())
+print('Detectron2:', detectron2.__version__)"
 ```
 
 ### 2.2 C++ 推理引擎编译
