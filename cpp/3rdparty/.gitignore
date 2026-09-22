@@ -1,0 +1,5 @@
+# Local binary dependency bundles are reproducible from the download scripts
+# but intentionally not committed to the source repository.
+*
+!.gitignore
+!SOURCE_MANIFEST.md

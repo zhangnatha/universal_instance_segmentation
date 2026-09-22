@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "universal-instance-seg"
+version = "0.2.0"
+description = "Backend-neutral industrial instance segmentation toolkit"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.23,<2"]
+
+[project.optional-dependencies]
+data = ["opencv-python>=4.7", "Pillow>=9,<10"]
+evaluation = ["opencv-python>=4.7", "pycocotools>=2.0"]
+detectron2 = ["torch>=2.5", "torchvision>=0.20", "detectron2", "timm>=1.0", "onnx>=1.16"]
+ultralytics = ["torch>=2.5", "torchvision>=0.20", "ultralytics>=8"]
+rfdetr = ["torch>=2.5", "rfdetr[train,loggers]"]
+export = ["onnx>=1.16", "onnxruntime>=1.17"]
+all = ["opencv-python>=4.7", "Pillow>=9,<10", "pycocotools>=2.0", "torch>=2.5", "torchvision>=0.20", "detectron2", "timm>=1.0", "onnx>=1.16", "onnxruntime>=1.17", "ultralytics>=8", "rfdetr[train,loggers]"]
+
+[project.scripts]
+instance-seg = "instance_segmentation.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["instance_segmentation*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".git", ".tox", ".venv", "venv", "build", "3rdparty"]
