@@ -56,18 +56,19 @@ def get_color(class_id: int, num_classes: int = 1) -> tuple[int, int, int]:
     return (b, g, r)
 
 
-def mask_to_row_major_rle(mask: np.ndarray) -> list[int]:
-    """将二值二维掩码编码为以背景开始的行优先游程编码（RLE）。"""
-    flat = mask.reshape(-1).astype(bool)
-    if flat.size == 0:
-        return []
-    diffs = np.diff(flat.view(np.int8))
-    change_indices = np.where(diffs != 0)[0] + 1
-    split_indices = np.concatenate(([0], change_indices, [flat.size]))
-    runs = np.diff(split_indices).tolist()
-    if flat[0]:
-        runs = [0] + runs
-    return runs
+def mask_to_coco_rle(mask: np.ndarray) -> dict[str, Any]:
+    """将二值掩码编码为两个评估器都能解码的 COCO RLE。"""
+    from pycocotools import mask as mask_utils
+
+    binary = np.asfortranarray(mask.astype(np.uint8))
+    encoded = mask_utils.encode(binary)
+    counts = encoded["counts"]
+    if isinstance(counts, bytes):
+        counts = counts.decode("ascii")
+    return {
+        "size": [int(mask.shape[0]), int(mask.shape[1])],
+        "counts": counts,
+    }
 
 
 def render_visual_overlay(image_bgr: np.ndarray, detections: list[dict], alpha: float = 0.40, num_classes: int = 1) -> np.ndarray:
@@ -289,12 +290,18 @@ def main(argv: list[str] | None = None) -> int:
                 "bbox_xyxy": [round(v, 2) for v in rec["bbox_xyxy"]],
             }
             if rec["mask_np"] is not None:
-                item["mask_rle"] = mask_to_row_major_rle(rec["mask_np"])
+                item["mask_rle"] = mask_to_coco_rle(rec["mask_np"])
                 item["mask_area"] = int(rec["mask_np"].sum())
             clean_records.append(item)
 
         payload = {
+            # 保留 LabelMe/compare_json 使用的元数据名称，同时保留
+            # RF-DETR 的精确检测结果和 COCO RLE 掩码。
+            "file": str(img_path),
+            "imagePath": img_path.name,
             "image": str(img_path),
+            "width": w,
+            "height": h,
             "imageWidth": w,
             "imageHeight": h,
             "preprocess": args.preprocess,

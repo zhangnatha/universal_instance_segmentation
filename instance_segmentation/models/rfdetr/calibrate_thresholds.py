@@ -142,7 +142,17 @@ def prediction_payload(image_path: Path, image: np.ndarray, predictions: list[di
             ],
             "contours_xy": [[[float(pt.get("x", 0.0)), float(pt.get("y", 0.0))] for pt in points]],
         })
-    return {"image": str(image_path.resolve()), "imageWidth": int(width), "imageHeight": int(height), "detections": records}
+    image_path = image_path.resolve()
+    return {
+        "file": str(image_path),
+        "imagePath": image_path.name,
+        "image": str(image_path),
+        "width": int(width),
+        "height": int(height),
+        "imageWidth": int(width),
+        "imageHeight": int(height),
+        "detections": records,
+    }
 
 
 def dump_json(path: Path, payload: dict[str, Any]) -> None:

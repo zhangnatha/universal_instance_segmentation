@@ -107,7 +107,7 @@ class UltralyticsBackend(InstanceSegmentationBackend):
             from collections import defaultdict
             from pathlib import Path
             from instance_segmentation.models.rfdetr.infer_dataset import (
-                mask_to_row_major_rle,
+                mask_to_coco_rle,
                 render_visual_overlay,
             )
 
@@ -138,7 +138,7 @@ class UltralyticsBackend(InstanceSegmentationBackend):
                         "bbox_xyxy": [round(float(v), 2) for v in p.bbox],
                     }
                     if p.mask is not None:
-                        item["mask_rle"] = mask_to_row_major_rle(p.mask)
+                        item["mask_rle"] = mask_to_coco_rle(p.mask)
                         item["mask_area"] = int(p.mask.sum())
                     detections_payload.append(item)
                     render_candidates.append({
@@ -150,7 +150,11 @@ class UltralyticsBackend(InstanceSegmentationBackend):
                     })
 
                 payload = {
+                    "file": str(img_path),
+                    "imagePath": img_path.name,
                     "image": str(img_path),
+                    "width": w,
+                    "height": h,
                     "imageWidth": w,
                     "imageHeight": h,
                     "detections": detections_payload,

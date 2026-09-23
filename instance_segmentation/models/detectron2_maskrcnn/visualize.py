@@ -199,6 +199,8 @@ def save_json(
 ):
     """将检测与分割结果保存为标准 JSON 格式。"""
     payload = {
+        "file": str(Path(source).expanduser()),
+        "imagePath": Path(source).name,
         "image": str(Path(source).expanduser()),
         "detections": detections,
         "visualization": str(Path(visualization).expanduser()),
@@ -207,5 +209,8 @@ def save_json(
         payload["width"] = int(width)
     if height is not None:
         payload["height"] = int(height)
+        payload["imageHeight"] = int(height)
+    if width is not None:
+        payload["imageWidth"] = int(width)
     with Path(path).open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
