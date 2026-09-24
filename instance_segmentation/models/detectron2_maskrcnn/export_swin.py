@@ -70,6 +70,17 @@ class OnnxModel(torch.nn.Module):
         proposals, _ = self.model.proposal_generator(images, features, None)
         instances = self.model.roi_heads._forward_box(features, proposals)[0]
         heads = self.model.roi_heads
+        if hasattr(heads, "angle_head"):
+            pooled = heads.box_pooler(
+                [features[name] for name in heads.box_in_features], [instances.pred_boxes]
+            )
+            angle_logits = heads.angle_head(pooled)
+            angle_probabilities = angle_logits.softmax(dim=1)
+            angle_confidence, angle_bins = angle_probabilities.max(dim=1)
+            instances.pred_angles = angle_bins.to(dtype=angle_logits.dtype) * (
+                heads.angle_period / heads.angle_bins
+            )
+            instances.angle_scores = angle_confidence
         mask_features = heads.mask_pooler(
             [features[name] for name in heads.mask_in_features],
             [instances.pred_boxes],
@@ -77,12 +88,22 @@ class OnnxModel(torch.nn.Module):
         mask_logits = heads.mask_head.layers(mask_features)
         indices = torch.arange(mask_logits.shape[0], device=instances.pred_classes.device)
         mask_probs = mask_logits[indices, instances.pred_classes][:, None].sigmoid()
-        return (
+        outputs = (
             instances.pred_boxes.tensor,
             instances.scores,
             instances.pred_classes,
             mask_probs,
         )
+        if hasattr(heads, "angle_head"):
+            angle_values = getattr(instances, "pred_angles", instances.scores)
+            angle_scores = getattr(instances, "angle_scores", instances.scores)
+            outputs += (
+                angle_values,
+                angle_scores,
+                heads.angle_class_mask_meta.to(dtype=angle_values.dtype)
+                + angle_values.sum() * 0.0,
+            )
+        return outputs
 
 
 def load_classes_from_file(classes_path: Path) -> list[str]:
@@ -177,6 +198,12 @@ def parse_args(argv: list[str] | None = None):
         default=0.5,
         help="Score threshold during tracing (default: 0.5)",
     )
+    parser.add_argument("--angle-head", action=argparse.BooleanOptionalAction, default=False,
+                        help="Export the trained angle head when the checkpoint includes it")
+    parser.add_argument("--angle-classes", nargs="*", default=None,
+                        help="Classes trained with angle labels; defaults to all classes")
+    parser.add_argument("--angle-bins", type=int, default=72)
+    parser.add_argument("--angle-period", type=float, default=360.0)
     parser.add_argument(
         "--opset",
         type=int,
@@ -209,6 +236,10 @@ def export_onnx(
     opset_version: int = 16,
     device: str = "cpu",
     sync_model_onnx: bool = True,
+    angle_head: bool = False,
+    angle_classes: list[str] | None = None,
+    angle_bins: int = 72,
+    angle_period: float = 360.0,
 ) -> Path:
     """将 Detectron2 Swin-S Mask R-CNN 模型导出为 ONNX 格式。"""
     print(f"[EXPORT_ONNX] Loading weights: {weights_path}")
@@ -223,6 +254,7 @@ def export_onnx(
     )
     cfg.MODEL.BACKBONE.NAME = "build_swin_s_fpn_backbone"
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = len(classes)
+    cfg.MODEL.ROI_HEADS.NAME = "AngleROIHeads" if angle_head else "StandardROIHeads"
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = score_threshold
     cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.5
     cfg.INPUT.MIN_SIZE_TEST = height
@@ -232,6 +264,17 @@ def export_onnx(
     cfg.MODEL.PIXEL_STD = [58.395, 57.12, 57.375]
     cfg.MODEL.WEIGHTS = str(weights_path)
     cfg.MODEL.DEVICE = device
+    if angle_head:
+        from instance_segmentation.models.detectron2_maskrcnn import angle_head as _angle_head  # noqa: F401
+        angle_names = classes if angle_classes is None else angle_classes
+        unknown = sorted(set(angle_names) - set(classes))
+        if unknown:
+            raise ValueError("Unknown angle classes: " + ", ".join(unknown))
+        cfg.ANGLE_BINS = int(angle_bins)
+        cfg.ANGLE_PERIOD = float(angle_period)
+        cfg.ANGLE_LOSS_WEIGHT = 1.0
+        cfg.ANGLE_LR_FACTOR = 0.01
+        cfg.ANGLE_CLASS_IDS = tuple(classes.index(name) for name in angle_names)
 
     # 构建 PyTorch 模型并加载权重
     model = build_model(cfg).eval()
@@ -268,12 +311,17 @@ def export_onnx(
                 str(temp_path),
                 opset_version=opset_version,
                 input_names=["image"],
-                output_names=["boxes", "scores", "classes", "mask_probs"],
+                output_names=(
+                    ["boxes", "scores", "classes", "mask_probs", "angles", "angle_scores", "angle_classes"]
+                    if angle_head else ["boxes", "scores", "classes", "mask_probs"]
+                ),
                 dynamic_axes={
                     "boxes": {0: "detections"},
                     "scores": {0: "detections"},
                     "classes": {0: "detections"},
                     "mask_probs": {0: "detections"},
+                    **({"angles": {0: "detections"}} if angle_head else {}),
+                    **({"angle_scores": {0: "detections"}} if angle_head else {}),
                 },
                 do_constant_folding=True,
             )
@@ -375,6 +423,10 @@ def main(argv: list[str] | None = None):
         opset_version=args.opset,
         device=args.device,
         sync_model_onnx=args.sync_model_onnx,
+        angle_head=args.angle_head,
+        angle_classes=args.angle_classes,
+        angle_bins=args.angle_bins,
+        angle_period=args.angle_period,
     )
 
 

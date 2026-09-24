@@ -66,7 +66,12 @@ def filter_predictions(
         candidates.sort(key=lambda item: item.score, reverse=True)
         threshold = ious[name]
         for candidate in candidates:
-            if threshold < 1.0 and any(bbox_iou(candidate.bbox, kept.bbox) > threshold for kept in selected if kept.class_name == name):
+            if threshold < 1.0 and any(
+                kept.image_id == candidate.image_id
+                and kept.class_name == name
+                and bbox_iou(candidate.bbox, kept.bbox) > threshold
+                for kept in selected
+            ):
                 continue
             selected.append(candidate)
     return sorted(selected, key=lambda item: item.score, reverse=True)

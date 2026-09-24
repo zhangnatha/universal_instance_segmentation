@@ -115,7 +115,7 @@ class UltralyticsBackend(InstanceSegmentationBackend):
             out_dir.mkdir(parents=True, exist_ok=True)
             by_image = defaultdict(list)
             for p in filtered:
-                by_image[p.image_path].append(p)
+                by_image[p.image_id].append(p)
 
             all_img_paths = [str(getattr(r, "path", "")) for r in results if getattr(r, "path", None)]
             for img_path_str in all_img_paths:
@@ -164,7 +164,7 @@ class UltralyticsBackend(InstanceSegmentationBackend):
                     json.dump(payload, fp, indent=2)
 
                 if config.get("draw", True) and img is not None:
-                    vis_img = render_visual_overlay(img, render_candidates)
+                    vis_img = render_visual_overlay(img, render_candidates, num_classes=len(classes))
                     cv2.imwrite(str(out_dir / f"{img_path.stem}_vis.jpg"), vis_img)
 
         return filtered

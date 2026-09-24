@@ -266,15 +266,39 @@ static void write_json(const fs::path& path, const fs::path& image_path,
   out << "  ]\n}\n";
 }
 
-// 在图像上绘制半透明掩码覆盖层、边界框及类别置信度标签
+// 使用与 RF-DETR C++ 一致的样式绘制掩码、轮廓、边界框及类别标签
 static void draw_detections(cv::Mat& image, const std::vector<Detection>& detections, const std::vector<std::string>& classes) {
+  cv::Mat overlay = image.clone();
   for (const auto& d : detections) {
     const cv::Scalar color = color_for(d.class_id, classes.size());
-    cv::Mat mask(image.rows, image.cols, CV_8U, const_cast<uint8_t*>(d.mask.data()));
-    cv::Mat layer = image.clone(); layer.setTo(color, mask); cv::addWeighted(layer, .28, image, .72, 0, image);
-    cv::rectangle(image, d.box, color, 2);
-    std::ostringstream label; label << classes[d.class_id] << " " << std::fixed << std::setprecision(2) << d.score;
-    cv::putText(image, label.str(), cv::Point(static_cast<int>(d.box.x), std::max(15, static_cast<int>(d.box.y) - 4)), cv::FONT_HERSHEY_SIMPLEX, .5, color, 1, cv::LINE_AA);
+    if (!d.mask.empty()) {
+      cv::Mat mask(image.rows, image.cols, CV_8U, const_cast<uint8_t*>(d.mask.data()));
+      overlay.setTo(color, mask);
+    }
+  }
+  cv::addWeighted(overlay, 0.40, image, 0.60, 0, image);
+
+  for (const auto& d : detections) {
+    const cv::Scalar color = color_for(d.class_id, classes.size());
+    if (!d.mask.empty()) {
+      cv::Mat mask(image.rows, image.cols, CV_8U, const_cast<uint8_t*>(d.mask.data()));
+      std::vector<std::vector<cv::Point>> contours;
+      cv::findContours(mask.clone(), contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+      cv::drawContours(image, contours, -1, color, 2, cv::LINE_AA);
+    }
+    cv::rectangle(image, d.box, color, 2, cv::LINE_AA);
+
+    std::ostringstream label;
+    label << classes[d.class_id] << " " << std::fixed << std::setprecision(2) << d.score;
+    const std::string text = label.str();
+    int baseline = 0;
+    const cv::Size text_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+    const int x = std::max(0, static_cast<int>(d.box.x));
+    const int y = std::max(text_size.height + 4, static_cast<int>(d.box.y) - 4);
+    cv::rectangle(image, cv::Point(x, y - text_size.height - 4),
+                  cv::Point(x + text_size.width + 6, y + baseline - 2), color, cv::FILLED);
+    cv::putText(image, text, cv::Point(x + 3, y - 2), cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
   }
 }
 
@@ -317,8 +341,16 @@ int main(int argc, char** argv) {
       cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR); if (image.empty()) { std::cerr << "skip unreadable " << image_path << "\n"; continue; }
       const Letterbox letterbox = preprocess(image, input_w, input_h);
       const std::array<int64_t, 4> input_dims{{1, 3, input_h, input_w}};
+      std::vector<float> input_data(static_cast<size_t>(3) * input_h * input_w);
+      for (int y = 0; y < input_h; ++y) {
+        for (int x = 0; x < input_w; ++x) {
+          const cv::Vec3f pixel = letterbox.image.at<cv::Vec3f>(y, x);
+          for (int channel = 0; channel < 3; ++channel)
+            input_data[static_cast<size_t>(channel) * input_h * input_w + static_cast<size_t>(y) * input_w + x] = pixel[channel];
+        }
+      }
       auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-      Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory, reinterpret_cast<float*>(letterbox.image.data), static_cast<size_t>(input_h) * input_w * 3, input_dims.data(), input_dims.size());
+      Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory, input_data.data(), input_data.size(), input_dims.data(), input_dims.size());
       const char* input_names[] = {input_name.get()};
       auto outputs = session.Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names.data(), output_names.size());
       int detection_index = -1, prototype_index = -1, mask_channels = 0, proto_h = 0, proto_w = 0;
@@ -334,8 +366,10 @@ int main(int argc, char** argv) {
         }
       }
       if (detection_index < 0 || prototype_index < 0) throw std::runtime_error("YOLO-seg outputs must contain rank-3 detections and rank-4 prototypes");
-      const int detection_channels = static_cast<int>(std::max(detection.shape[1], detection.shape[2]));
-      const bool channels_first = detection.shape[1] == detection_channels;
+      // Ultralytics 导出的形状为 [1, channels, anchors]（YOLO11）或 [1, anchors, channels]。
+      // 对这两种布局，较小的非批次维度均为通道轴。
+      const bool channels_first = detection.shape[1] < detection.shape[2];
+      const int detection_channels = static_cast<int>(channels_first ? detection.shape[1] : detection.shape[2]);
       const int anchors = static_cast<int>(channels_first ? detection.shape[2] : detection.shape[1]);
       std::vector<std::string> eff_classes = args.classes;
       std::vector<float> eff_class_conf = args.class_conf;

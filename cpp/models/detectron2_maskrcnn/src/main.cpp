@@ -1,7 +1,8 @@
 // Detectron2 Mask R-CNN C++ ONNX 推理实现：
 // 支持单图推理、批量目录推理以及交互式服务（Server）模式。
 // 模型输入：image [3, H, W] (BGR 平面浮点张量)
-// 模型输出：boxes [N, 4], scores [N], classes [N], mask_probs [N, 1, MH, MW]
+// 模型输出：boxes [N,4], scores [N], classes [N], mask_probs [N,1,MH,MW]；
+// 角度头模型额外输出 angles [N]、angle_scores [N] 和 angle_classes [C]。
 
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/core.hpp>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <streambuf>
 #include <string>
+#include <utility>
 #include <vector>
 
 // 单个目标的检测与分割预测结果
@@ -34,6 +36,7 @@ struct Detection {
   std::array<float, 4> box{};                                     // 边界框坐标 [x0, y0, x1, y1]
   std::vector<uint8_t> mask;                                      // 二值分割掩码（尺寸与原图一致，单通道）
   double angle_degrees = std::numeric_limits<double>::quiet_NaN();// 目标主方向角度（度数）
+  double angle_score = std::numeric_limits<double>::quiet_NaN();   // 角度分类置信度
   int center_x = 0;                                               // 目标中心 X 坐标
   int center_y = 0;                                               // 目标中心 Y 坐标
 };
@@ -321,24 +324,38 @@ std::vector<uint8_t> paste_mask(const float* mask, int mask_height, int mask_wid
   return result;
 }
 
-// 利用图像二阶中心矩（Moments）计算分割掩码的主方向角度与几何质心
-void calculate_mask_direction(Detection& detection, int width, int height) {
+// 利用分割掩码矩计算角度箭头的质心；方向角必须来自训练过的模型角度头。
+bool calculate_mask_center(Detection& detection, int width, int height) {
   const cv::Mat mask(height, width, CV_8UC1, detection.mask.data());
   const cv::Moments moments = cv::moments(mask, true);
-  if (moments.m00 < 2.0) return;
+  if (moments.m00 < 2.0) return false;
   const double cx = moments.m10 / moments.m00;
   const double cy = moments.m01 / moments.m00;
-  const double covariance_xx = moments.mu20;
-  const double covariance_xy = moments.mu11;
-  const double covariance_yy = moments.mu02;
-  double angle = 0.5 * std::atan2(2.0 * covariance_xy, covariance_xx - covariance_yy);
-  if (std::sin(angle) < 0.0) angle += CV_PI;
-  detection.angle_degrees = std::fmod(angle * 180.0 / CV_PI + 180.0, 180.0);
   detection.center_x = cvRound(cx);
   detection.center_y = cvRound(cy);
+  return true;
 }
 
-// 在图像上绘制目标类别名称和置信度标签
+// 返回结果图标签用的类别缩写；结果 JSON 仍保存完整类别名称。
+std::string class_abbreviation(const std::string& class_name) {
+  std::string normalized = class_name;
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+  if (normalized == "breast") return "BR";
+  if (normalized == "cord") return "CO";
+  if (normalized == "leg") return "LE";
+  if (normalized == "milkcup") return "MC";
+  std::string abbreviation;
+  for (char value : class_name) {
+    if (std::isalnum(static_cast<unsigned char>(value))) {
+      abbreviation.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(value))));
+      if (abbreviation.size() == 2) break;
+    }
+  }
+  return abbreviation.empty() ? class_name : abbreviation;
+}
+
+// 在图像上绘制完整类别名称和置信度标签
 void draw_label(cv::Mat& image, const Detection& detection,
                 const std::vector<std::string>& classes) {
   std::ostringstream stream;
@@ -362,11 +379,102 @@ void draw_label(cv::Mat& image, const Detection& detection,
               cv::Scalar(0, 0, 0), thickness, cv::LINE_AA);
 }
 
-// 渲染可视化结果：绘制半透明分割掩码、检测矩形框、类别标签及主方向箭头
+// 在箭头尖端绘制沿箭头方向排布的角度与置信度标签。
+void draw_direction_arrow(cv::Mat& image, const cv::Point& start,
+                          const cv::Point& end) {
+  const cv::Point2d vector(end.x - start.x, end.y - start.y);
+  const double length = cv::norm(vector);
+  if (length < 1.0) return;
+  const cv::Point2d direction = vector * (1.0 / length);
+  const double head_length = std::min(14.0, std::max(6.0, length * 0.14));
+  const double half_opening = 22.5 * CV_PI / 180.0;
+  cv::line(image, start, end, cv::Scalar(0, 0, 255), 4, cv::LINE_AA);
+  const double reverse_angle = std::atan2(direction.y, direction.x) + CV_PI;
+  for (double sign : {-1.0, 1.0}) {
+    const double wing_angle = reverse_angle + sign * half_opening;
+    const cv::Point wing(cvRound(end.x + head_length * std::cos(wing_angle)),
+                         cvRound(end.y + head_length * std::sin(wing_angle)));
+    cv::line(image, end, wing, cv::Scalar(0, 0, 255), 4, cv::LINE_AA);
+  }
+}
+
+void draw_angle_label(cv::Mat& image, const cv::Point& start,
+                      const cv::Point& end, double angle_degrees, double score,
+                      const std::string& abbreviation, const cv::Scalar& color) {
+  std::ostringstream stream;
+  stream << abbreviation << ' ' << std::fixed << std::setprecision(1) << angle_degrees
+         << "deg | " << std::setprecision(2) << score;
+  const std::string text = stream.str();
+  const int font = cv::FONT_HERSHEY_SIMPLEX;
+  double scale = 0.46;
+  const int thickness = 1;
+  int baseline = 0;
+  int base_baseline = 0;
+  const cv::Size base_text_size = cv::getTextSize(text, font, scale, thickness, &base_baseline);
+  const double arrow_length = cv::norm(cv::Point2d(end.x - start.x, end.y - start.y));
+  const int padding = std::max(1, std::min(4, cvRound(arrow_length * 0.02)));
+  const double max_width = std::max(1.0, arrow_length * 0.78 - padding * 2);
+  scale = std::min(scale, max_width / std::max(base_text_size.width, 1));
+  const cv::Size text_size = cv::getTextSize(text, font, scale, thickness, &baseline);
+  const int width = text_size.width + padding * 2;
+  const int height = text_size.height + baseline + padding * 2;
+  const cv::Scalar background(250.0 * 0.88 + color[0] * 0.12,
+                              250.0 * 0.88 + color[1] * 0.12,
+                              250.0 * 0.88 + color[2] * 0.12);
+  const cv::Scalar text_color(color[0] * 0.65, color[1] * 0.65, color[2] * 0.65);
+  cv::Mat patch(height, width, CV_8UC3, background);
+  cv::rectangle(patch, cv::Point(0, 0), cv::Point(width - 1, height - 1),
+                color, 1, cv::LINE_AA);
+  cv::putText(patch, text, cv::Point(padding, padding + text_size.height), font,
+              scale, text_color, thickness, cv::LINE_AA);
+
+  const cv::Point2d center(start.x + (end.x - start.x) * 0.52,
+                           start.y + (end.y - start.y) * 0.52);
+  // 文字基线始终沿箭头方向，顺序固定为角度在前、得分在后。
+  const cv::Mat rotation = cv::getRotationMatrix2D(
+      cv::Point2f(width / 2.0F, height / 2.0F), -angle_degrees, 1.0);
+  const double abs_cos = std::abs(rotation.at<double>(0, 0));
+  const double abs_sin = std::abs(rotation.at<double>(0, 1));
+  const int bound_width = static_cast<int>(std::ceil(height * abs_sin + width * abs_cos));
+  const int bound_height = static_cast<int>(std::ceil(height * abs_cos + width * abs_sin));
+  cv::Mat adjusted = rotation.clone();
+  adjusted.at<double>(0, 2) += bound_width / 2.0 - width / 2.0;
+  adjusted.at<double>(1, 2) += bound_height / 2.0 - height / 2.0;
+  cv::Mat rotated;
+  cv::warpAffine(patch, rotated, adjusted, cv::Size(bound_width, bound_height),
+                 cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+  cv::Mat patch_mask(height, width, CV_8UC1, cv::Scalar(255));
+  cv::Mat rotated_mask;
+  cv::warpAffine(patch_mask, rotated_mask, adjusted, cv::Size(bound_width, bound_height),
+                 cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+
+  const int x0 = cvRound(center.x - bound_width / 2.0);
+  const int y0 = cvRound(center.y - bound_height / 2.0);
+  const int dst_x0 = std::max(0, x0);
+  const int dst_y0 = std::max(0, y0);
+  const int dst_x1 = std::min(image.cols, x0 + bound_width);
+  const int dst_y1 = std::min(image.rows, y0 + bound_height);
+  if (dst_x0 >= dst_x1 || dst_y0 >= dst_y1) return;
+  const cv::Rect dst_rect(dst_x0, dst_y0, dst_x1 - dst_x0, dst_y1 - dst_y0);
+  const cv::Rect src_rect(dst_x0 - x0, dst_y0 - y0, dst_rect.width, dst_rect.height);
+  cv::Mat blended;
+  cv::addWeighted(rotated(src_rect), 0.92, image(dst_rect), 0.08, 0.0, blended);
+  blended.copyTo(image(dst_rect), rotated_mask(src_rect));
+}
+
+// 渲染可视化结果；仅对 ONNX 角度头覆盖的类别绘制预测方向箭头。
 void render(cv::Mat& image, const std::vector<Detection>& detections,
             const std::vector<std::string>& classes) {
   const double alpha = 0.25;
-  std::vector<std::pair<cv::Point, cv::Point> > arrows;
+  struct ArrowLabel {
+    cv::Point start;
+    cv::Point end;
+    double angle;
+    double score;
+    std::string abbreviation;
+    cv::Scalar color;
+  };
+  std::vector<ArrowLabel> arrows;
   for (const Detection& detection : detections) {
     const cv::Scalar color = color_for(detection.class_id, classes.size());
     const cv::Mat mask(image.rows, image.cols, CV_8UC1,
@@ -379,19 +487,24 @@ void render(cv::Mat& image, const std::vector<Detection>& detections,
                   cv::Point(cvRound(detection.box[2]), cvRound(detection.box[3])),
                   color, 2);
     draw_label(image, detection, classes);
-    if (detection.class_id == 0 && std::isfinite(detection.angle_degrees)) {
+    if (std::isfinite(detection.angle_degrees)) {
       const double radians = detection.angle_degrees * CV_PI / 180.0;
-      const double length = std::max(detection.box[2] - detection.box[0],
-                                     detection.box[3] - detection.box[1]);
+      const double length = 0.5 * std::max(detection.box[2] - detection.box[0],
+                                           detection.box[3] - detection.box[1]);
       const cv::Point start(detection.center_x, detection.center_y);
       const cv::Point end(cvRound(start.x + length * std::cos(radians)),
                           cvRound(start.y + length * std::sin(radians)));
-      arrows.push_back(std::make_pair(start, end));
+      const double angle_score = std::isfinite(detection.angle_score)
+                                     ? detection.angle_score : detection.score;
+      arrows.push_back({start, end, detection.angle_degrees, angle_score,
+                        class_abbreviation(classes[static_cast<size_t>(detection.class_id)]), color});
     }
   }
-  for (const std::pair<cv::Point, cv::Point>& arrow : arrows)
-    cv::arrowedLine(image, arrow.first, arrow.second, cv::Scalar(0, 0, 255),
-                    4, cv::LINE_AA, 0, 0.25);
+  for (const auto& arrow : arrows)
+    draw_direction_arrow(image, arrow.start, arrow.end);
+  for (const auto& arrow : arrows)
+    draw_angle_label(image, arrow.start, arrow.end, arrow.angle, arrow.score,
+                     arrow.abbreviation, arrow.color);
 }
 
 // 提取掩码外轮廓并序列化为多边形顶点坐标 JSON 数组
@@ -459,6 +572,8 @@ void write_json(const std::string& path, const std::string& image_path,
     write_mask_polygons(output, d.mask, height, width);
     if (std::isfinite(d.angle_degrees))
       output << ", \"angle_degrees\": " << d.angle_degrees;
+    if (std::isfinite(d.angle_score))
+      output << ", \"angle_score\": " << d.angle_score;
     output << "}" << (i + 1 == detections.size() ? "\n" : ",\n");
   }
   output << "  ]\n}\n";
@@ -487,11 +602,21 @@ void infer_image(Ort::Session& session, const std::string& input_path,
   Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
       memory, input_data.data(), input_data.size(), input_shape.data(), input_shape.size());
   const std::array<const char*, 1> input_names{{"image"}};
-  const std::array<const char*, 4> output_names{{"boxes", "scores", "classes", "mask_probs"}};
+  const size_t output_count = session.GetOutputCount();
+  std::vector<const char*> output_names{
+      "boxes", "scores", "classes", "mask_probs"};
+  if (output_count == 6) {
+    output_names.push_back("angles");
+    output_names.push_back("angle_classes");
+  } else if (output_count == 7) {
+    output_names.push_back("angles");
+    output_names.push_back("angle_scores");
+    output_names.push_back("angle_classes");
+  }
   const std::chrono::steady_clock::time_point infer_start = std::chrono::steady_clock::now();
   std::vector<Ort::Value> outputs = session.Run(
       Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1,
-      output_names.data(), output_names.size());
+      output_names.data(), session.GetOutputCount());
   const std::chrono::steady_clock::time_point infer_end = std::chrono::steady_clock::now();
   std::cout << "Inference latency: "
             << std::chrono::duration<double, std::milli>(infer_end - infer_start).count()
@@ -511,6 +636,29 @@ void infer_image(Ort::Session& session, const std::string& input_path,
   const float* scores = outputs[1].GetTensorData<float>();
   const int64_t* class_ids = outputs[2].GetTensorData<int64_t>();
   const float* masks = outputs[3].GetTensorData<float>();
+  const float* angles = nullptr;
+  const float* angle_scores = nullptr;
+  const float* angle_classes = nullptr;
+  size_t angle_class_count = 0;
+  if (outputs.size() == 6 || outputs.size() == 7) {
+    const std::vector<int64_t> angle_shape = outputs[4].GetTensorTypeAndShapeInfo().GetShape();
+    const size_t class_output_index = outputs.size() == 7 ? 6 : 5;
+    const std::vector<int64_t> angle_class_shape =
+        outputs[class_output_index].GetTensorTypeAndShapeInfo().GetShape();
+    if (angle_shape.size() != 1 || angle_shape[0] != box_shape[0] ||
+        angle_class_shape.size() != 1 || angle_class_shape[0] <= 0)
+      throw std::runtime_error("Unexpected angle output shape");
+    angles = outputs[4].GetTensorData<float>();
+    if (outputs.size() == 7) {
+      const std::vector<int64_t> angle_score_shape =
+          outputs[5].GetTensorTypeAndShapeInfo().GetShape();
+      if (angle_score_shape.size() != 1 || angle_score_shape[0] != box_shape[0])
+        throw std::runtime_error("Unexpected angle score output shape");
+      angle_scores = outputs[5].GetTensorData<float>();
+    }
+    angle_classes = outputs[class_output_index].GetTensorData<float>();
+    angle_class_count = static_cast<size_t>(angle_class_shape[0]);
+  }
   const int mask_height = static_cast<int>(mask_shape[2]);
   const int mask_width = static_cast<int>(mask_shape[3]);
   const size_t mask_pixels = static_cast<size_t>(mask_width) * mask_height;
@@ -538,7 +686,12 @@ void infer_image(Ort::Session& session, const std::string& input_path,
     std::copy_n(boxes + i * 4, 4, detection.box.begin());
     detection.mask = paste_mask(masks + i * mask_pixels, mask_height, mask_width,
                                 detection.box, image.rows, image.cols);
-    if (class_id == 0) calculate_mask_direction(detection, image.cols, image.rows);
+    if (angles && static_cast<size_t>(class_id) < angle_class_count &&
+        angle_classes[class_id] > 0.5F && std::isfinite(angles[i]) &&
+        calculate_mask_center(detection, image.cols, image.rows)) {
+      detection.angle_degrees = angles[i];
+      detection.angle_score = angle_scores ? angle_scores[i] : scores[i];
+    }
     detections.push_back(detection);
   }
   detections = class_nms(std::move(detections), eff_class_conf, eff_class_iou);
@@ -573,10 +726,12 @@ int main(int argc, char** argv) {
 
   const std::chrono::steady_clock::time_point load_start = std::chrono::steady_clock::now();
   Ort::Session session(env, args.model.c_str(), options);
-  if (session.GetInputCount() != 1 || session.GetOutputCount() != 4)
+  const size_t output_count = session.GetOutputCount();
+  if (session.GetInputCount() != 1 ||
+      (output_count != 4 && output_count != 6 && output_count != 7))
     throw std::runtime_error(
-        "Detectron2 Mask R-CNN ONNX requires one input and exactly four outputs: "
-        "boxes, scores, classes, mask_probs");
+        "Detectron2 Mask R-CNN ONNX requires boxes, scores, classes, mask_probs "
+        "and optional angles, angle_scores, angle_classes outputs");
   const std::vector<int64_t> input_shape =
       session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
   if (input_shape.size() != 3 || input_shape[0] != 3 || input_shape[1] <= 0 ||
@@ -590,6 +745,17 @@ int main(int argc, char** argv) {
     auto output_name = session.GetOutputNameAllocated(i, contract_allocator);
     if (output_name.get() == nullptr || std::string(output_name.get()) != contract_outputs[i])
       throw std::runtime_error("Detectron2 output names must be boxes,scores,classes,mask_probs");
+  }
+  if (output_count == 6 || output_count == 7) {
+    const std::vector<const char*> angle_outputs = output_count == 7
+        ? std::vector<const char*>{"angles", "angle_scores", "angle_classes"}
+        : std::vector<const char*>{"angles", "angle_classes"};
+    for (size_t i = 0; i < angle_outputs.size(); ++i) {
+      auto output_name = session.GetOutputNameAllocated(i + 4, contract_allocator);
+      if (output_name.get() == nullptr || std::string(output_name.get()) != angle_outputs[i])
+        throw std::runtime_error(
+            "Detectron2 optional output names must be angles[,angle_scores],angle_classes");
+    }
   }
   const std::chrono::steady_clock::time_point load_end = std::chrono::steady_clock::now();
   std::cout << "OpenCV: " << CV_VERSION << '\n';

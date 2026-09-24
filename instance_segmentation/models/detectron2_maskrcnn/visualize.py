@@ -63,6 +63,12 @@ def draw_label(image, text: str, origin: tuple[int, int], color: tuple[int, int,
     cv2.putText(image, text, (x + 2, box_y - baseline - 1), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
 
 
+def class_abbreviation(class_name: str) -> str:
+    """返回结果图标签用的短类别名；JSON 仍保留完整类别名。"""
+    abbreviations = {"breast": "BR", "cord": "CO", "leg": "LE", "milkcup": "MC"}
+    return abbreviations.get(class_name.lower(), class_name[:2].upper())
+
+
 def mask_angle(mask: np.ndarray) -> float | None:
     """返回 mask 长轴在图像坐标系中的角度。
 
@@ -115,6 +121,79 @@ def arrow_points(
     )
     end = center_xy + length * direction
     return tuple(np.rint(center_xy).astype(int)), tuple(np.rint(end).astype(int))
+
+
+def draw_direction_arrow(image, start, end):
+    """绘制开角较窄的箭头，避免默认箭头头部过宽。"""
+    vector = np.asarray(end, dtype=np.float64) - np.asarray(start, dtype=np.float64)
+    length = float(np.linalg.norm(vector))
+    if length < 1.0:
+        return
+    direction = vector / length
+    head_length = min(14.0, max(6.0, length * 0.14))
+    half_opening = np.radians(22.5)
+    cv2.line(image, start, end, (0, 0, 255), 4, cv2.LINE_AA)
+    for sign in (-1.0, 1.0):
+        angle = np.arctan2(direction[1], direction[0]) + np.pi + sign * half_opening
+        wing = np.asarray(end, dtype=np.float64) + head_length * np.asarray(
+            (np.cos(angle), np.sin(angle)))
+        cv2.line(image, end, tuple(np.rint(wing).astype(int)), (0, 0, 255), 4, cv2.LINE_AA)
+
+
+def draw_angle_label(image, start, end, angle_degrees, score, abbreviation, color):
+    """在线段中部绘制与箭头平行、且不超过箭杆长度的角度置信度标签。"""
+    text = f"{abbreviation} {angle_degrees:.1f}deg | {score:.2f}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thickness = 0.46, 1
+    arrow_length = float(np.linalg.norm(np.asarray(end, dtype=np.float64) - start))
+    padding = max(1, min(4, int(round(arrow_length * 0.02))))
+    max_width = max(1.0, arrow_length * 0.78 - padding * 2)
+    base_width = cv2.getTextSize(text, font, scale, thickness)[0][0]
+    scale = min(scale, max_width / max(base_width, 1))
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    width = text_width + padding * 2
+    height = text_height + baseline + padding * 2
+    color = np.asarray(color, dtype=np.float32)
+    background = tuple(int(value) for value in np.rint(250.0 * 0.88 + color * 0.12))
+    text_color = tuple(int(value) for value in np.rint(color * 0.65))
+    border_color = tuple(int(value) for value in np.rint(color))
+    patch = np.full((height, width, 3), background, dtype=np.uint8)
+    cv2.rectangle(patch, (0, 0), (width - 1, height - 1), border_color, 1, cv2.LINE_AA)
+    cv2.putText(patch, text, (padding, padding + text_height), font, scale,
+                text_color, thickness, cv2.LINE_AA)
+
+    radians = np.radians(angle_degrees)
+    direction = np.asarray((np.cos(radians), np.sin(radians)))
+    center = np.asarray(start, dtype=np.float64) + (np.asarray(end, dtype=np.float64) - start) * 0.52
+    # 标签基线始终顺着箭头方向，保证角度在前、得分在后的阅读顺序一致。
+    rotation = -float(angle_degrees)
+    matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), rotation, 1.0)
+    bound_width = int(np.ceil(height * abs(np.sin(np.radians(rotation))) +
+                              width * abs(np.cos(np.radians(rotation)))))
+    bound_height = int(np.ceil(height * abs(np.cos(np.radians(rotation))) +
+                               width * abs(np.sin(np.radians(rotation)))))
+    matrix[0, 2] += bound_width / 2.0 - width / 2.0
+    matrix[1, 2] += bound_height / 2.0 - height / 2.0
+    rotated = cv2.warpAffine(patch, matrix, (bound_width, bound_height),
+                             flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+    rotated_mask = cv2.warpAffine(
+        np.full((height, width), 255, dtype=np.uint8), matrix,
+        (bound_width, bound_height), flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+
+    x0 = int(round(center[0] - bound_width / 2.0))
+    y0 = int(round(center[1] - bound_height / 2.0))
+    x1, y1 = x0 + bound_width, y0 + bound_height
+    dst_x0, dst_y0 = max(0, x0), max(0, y0)
+    dst_x1, dst_y1 = min(image.shape[1], x1), min(image.shape[0], y1)
+    if dst_x0 >= dst_x1 or dst_y0 >= dst_y1:
+        return
+    src = rotated[dst_y0 - y0:dst_y1 - y0, dst_x0 - x0:dst_x1 - x0]
+    mask = rotated_mask[dst_y0 - y0:dst_y1 - y0, dst_x0 - x0:dst_x1 - x0] > 0
+    roi = image[dst_y0:dst_y1, dst_x0:dst_x1]
+    blended = cv2.addWeighted(src, 0.92, roi, 0.08, 0.0)
+    roi[mask] = blended[mask]
 
 
 def draw_predictions(
@@ -177,15 +256,18 @@ def draw_predictions(
                     # 训练标签和 mask_angle 均以向右为 0°、向下为 90°。
                     # 不能把模型角度再转换成“正上方为 0°”，否则箭头会旋转 90°。
                     start, end = arrow_points(box, angle, center=center)
-                    arrows.append((start, end))
+                    arrows.append((start, end, angle, angle_score if angle_score is not None else score,
+                                   class_abbreviation(class_name), color))
                     record["angle_degrees"] = angle
                     if angle_score is not None:
                         record["angle_score"] = angle_score
         records.append(record)
 
     # 最后绘制，避免后续实例的半透明 mask 将箭头颜色冲淡。
-    for start, end in arrows:
-        cv2.arrowedLine(output, start, end, (0, 0, 255), 4, cv2.LINE_AA, tipLength=0.25)
+    for start, end, _, _, _, _ in arrows:
+        draw_direction_arrow(output, start, end)
+    for start, end, angle, angle_score, abbreviation, color in arrows:
+        draw_angle_label(output, start, end, angle, angle_score, abbreviation, color)
     return output, records
 
 

@@ -34,6 +34,17 @@ class OnnxModel(torch.nn.Module):
         proposals, _ = self.model.proposal_generator(images, features, None)
         instances = self.model.roi_heads._forward_box(features, proposals)[0]
         heads = self.model.roi_heads
+        if hasattr(heads, "angle_head"):
+            pooled = heads.box_pooler(
+                [features[name] for name in heads.box_in_features], [instances.pred_boxes]
+            )
+            angle_logits = heads.angle_head(pooled)
+            angle_probabilities = angle_logits.softmax(dim=1)
+            angle_confidence, angle_bins = angle_probabilities.max(dim=1)
+            instances.pred_angles = angle_bins.to(dtype=angle_logits.dtype) * (
+                heads.angle_period / heads.angle_bins
+            )
+            instances.angle_scores = angle_confidence
         mask_features = heads.mask_pooler(
             [features[name] for name in heads.mask_in_features],
             [instances.pred_boxes],
@@ -41,12 +52,22 @@ class OnnxModel(torch.nn.Module):
         mask_logits = heads.mask_head.layers(mask_features)
         indices = torch.arange(mask_logits.shape[0], device=instances.pred_classes.device)
         mask_probs = mask_logits[indices, instances.pred_classes][:, None].sigmoid()
-        return (
+        outputs = (
             instances.pred_boxes.tensor,
             instances.scores,
             instances.pred_classes,
             mask_probs,
         )
+        if hasattr(heads, "angle_head"):
+            angle_values = getattr(instances, "pred_angles", instances.scores)
+            angle_scores = getattr(instances, "angle_scores", instances.scores)
+            outputs += (
+                angle_values,
+                angle_scores,
+                heads.angle_class_mask_meta.to(dtype=angle_values.dtype)
+                + angle_values.sum() * 0.0,
+            )
+        return outputs
 
 
 def parse_args(argv=None):
@@ -236,12 +257,18 @@ def main(argv=None):
                 str(export_path),
                 opset_version=args.opset,
                 input_names=["image"],
-                output_names=["boxes", "scores", "classes", "mask_probs"],
+                output_names=(
+                    ["boxes", "scores", "classes", "mask_probs", "angles", "angle_scores", "angle_classes"]
+                    if hasattr(model.roi_heads, "angle_head")
+                    else ["boxes", "scores", "classes", "mask_probs"]
+                ),
                 dynamic_axes={
                     "boxes": {0: "detections"},
                     "scores": {0: "detections"},
                     "classes": {0: "detections"},
                     "mask_probs": {0: "detections"},
+                    **({"angles": {0: "detections"}} if hasattr(model.roi_heads, "angle_head") else {}),
+                    **({"angle_scores": {0: "detections"}} if hasattr(model.roi_heads, "angle_head") else {}),
                 },
                 do_constant_folding=not args.no_constant_folding,
             )
