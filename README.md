@@ -296,13 +296,43 @@ python -m instance_segmentation.models.detectron2_maskrcnn.train \
 |---|---|---|---|
 | `--train-dir` / `--val-dir` | 训练集与验证集独立目录路径 | `--train-dir /path/train` | **必选**。输入包含图片与 LabelMe JSON 的目录 |
 | `--classes` | 目标类别列表（空格分隔，顺序固定） | `--classes class1 class2` | **必选**。全流程严格保持顺序对齐 |
-| `--backbone` | 特征提取主干网络架构 | `--backbone swin_s` | CNN 选 `r50/r101/x101/convnext`；Transformer 选 `swin_t/s/b` |
+| `--backbone` | 特征提取主干网络架构 | `--backbone swin_s` | CNN 选 `r50/r101/x101/convnext`；Transformer 选 `swin_t/s/b`；加载自训练权重时须与其架构相符 |
+| `--backbone-impl` | 现代主干网络实现 | `--backbone-impl native` | 可选 `native/timm`；须与主干和 checkpoint 匹配 |
+| `--freeze-at`、`--resnet-norm` | 主干冻结阶段与 ResNet 归一化层 | `--freeze-at 0 --resnet-norm BN` | 按 backbone 架构调整；通常保持 checkpoint 训练时的配置 |
+| `--weights` | 已有 Detectron2 `.pth` 模型权重 | `--weights /path/to/model.pth` | 用模型权重初始化新 run，不恢复优化器、调度器或迭代状态；使用新的 `--output-dir`。类别名和顺序须匹配；类别数变化会使形状不匹配的预测层重新初始化并在日志提示 |
+| `--resume` | 从 `--output-dir/last_checkpoint` 恢复训练状态 | `--resume` | 恢复原 run 的模型、优化器、调度器和迭代状态；继续使用原输出目录，不接受 checkpoint 路径 |
+| `--from-scratch` | 随机初始化模型 | `--from-scratch` | 从零训练；与 `--weights`、`--pretrained-backbone` 互斥，且不可与 `--resume` 同用 |
+| `--pretrained-backbone` | 使用官方 ImageNet backbone 权重初始化 | `--pretrained-backbone` | 只初始化 backbone；与 `--weights`、`--from-scratch` 互斥，且不可与 `--resume` 同用；所选 backbone 须对应相应预训练结构 |
+| `--experiment` | 数据集注册名称 | `--experiment training` | 指定内部数据集注册名 |
+| `--auto-split`、`--val-ratio`、`--split-seed` | 从 `--train-dir` 自动划分验证集 | `--auto-split --val-ratio 0.2 --split-seed 42` | 与 `--val-dir` 互斥；未指定 split seed 时沿用 `--seed` |
+| `--hard-negative-dir`、`--hard-negative-repeat` | 加入空标注困难负样本及其采样重复次数 | `--hard-negative-dir /data/negatives --hard-negative-repeat 1` | 仅使用训练来源生成的负样本，不能与验证/测试图像重叠 |
 | `--output-dir` | 模型检查点与日志存放目录 | `--output-dir output/d2_swin` | 产出 `model_best.pth` 与 TensorBoard 曲线 |
 | `--max-iter` / `--batch-size` | 训练总迭代步数与单批次样本量 | `--max-iter 12000 --batch-size 4` | 依据数据量调整，建议总训练步数等效于 30~50 Epoch |
 | `--base-lr` / `--lr-scheduler` | 初始基础学习率与调度策略 | `--base-lr 1e-4 --lr-scheduler WarmupCosineLR` | CNN 推荐 `1e-3`；Swin Transformer 推荐 `1e-4` 配合余弦退火 |
+| `--lr-steps`、`--lr-gamma`、`--warmup-iters`、`--warmup-factor`、`--warmup-method` | 学习率里程碑、衰减倍率与 warmup 设置 | `--lr-steps 8000 10000 --warmup-iters 200` | 按总迭代数调整；`--lr-steps` 可省略数值表示空里程碑 |
+| `--weight-decay`、`--weight-decay-norm`、`--weight-decay-bias`、`--bias-lr-factor` | 权重衰减及 bias 学习率设置 | `--weight-decay 0.0001 --weight-decay-norm 0` | 覆盖优化器的通用、归一化层和 bias 参数设置 |
+| `--optimizer`、`--momentum`、`--nesterov`、`--adam-beta1`、`--adam-beta2`、`--adam-eps` | 优化器及其动量/数值稳定参数 | `--optimizer adamw --adam-beta1 0.9 --adam-beta2 0.999` | `--momentum` / `--nesterov` 用于 SGD；Adam 参数用于 AdamW |
+| `--clip-gradients`、`--gradient-clip-type`、`--gradient-clip-value`、`--gradient-clip-norm`、`--gradient-clip-norm-type` | 梯度裁剪开关、类型和阈值 | `--gradient-clip-type norm --gradient-clip-norm 5` | 可按训练稳定性调整裁剪方式 |
+| `--checkpoint-period`、`--eval-period`、`--save-best`、`--early-stop-patience`、`--early-stop-metric` | 检查点间隔、验证间隔、最佳权重保存与早停 | `--checkpoint-period 1000 --eval-period 500 --early-stop-patience 10` | 最佳权重与早停需要验证集 |
 | `--device` / `--amp` | 计算设备与混合精度加速 | `--device cuda --amp` | GPU 环境推荐启用 `--amp`，节省显存并提速 30%+ |
+| `--tf32`、`--cudnn-benchmark` | TF32 矩阵/卷积与 cuDNN kernel 调优 | `--tf32 --cudnn-benchmark` | 适用于支持的 NVIDIA GPU |
 | `--augment-*` | 在线动态图像增强组合开关 | `--augment-rotation --rotation-range -5.0 5.0` | 内存中动态旋转、调光、CLAHE 局部均衡，提升泛化抗噪能力 |
 | `--num-workers` | 数据加载子进程并发数 | `--num-workers 4` | 推荐设为 CPU 核心数的 1/2，加速 DataLoader 吞吐 |
+| `--pin-memory`、`--persistent-workers`、`--prefetch-factor` | DataLoader 锁页内存、常驻 worker 和预取批次数 | `--num-workers 4 --prefetch-factor 2` | `pin-memory` 缺省时随设备决定；persistent workers 仅在 workers 大于 0 时生效 |
+| `--min-size`、`--max-size`、`--multi-scale`、`--random-flip`、`--train-size-sampling` | 输入尺寸、多尺度、翻转及训练短边采样 | `--min-size 480 --max-size 800 --multi-scale --random-flip horizontal` | `--train-size-sampling` 可选 `choice/range` |
+| `--mask-format`、`--aspect-ratio-grouping`、`--filter-empty-annotations`、`--sampler-train`、`--repeat-sqrt`、`--repeat-threshold` | mask 编码、批次分组、空标注过滤及类别重复采样 | `--mask-format polygon --sampler-train RepeatFactorTrainingSampler` | 重复采样阈值仅在相应 sampler 下生效 |
+| `--nms-threshold`、`--max-detections`、`--roi-batch-size-per-image`、`--roi-positive-fraction` | ROI/NMS 设置和每图检测上限 | `--roi-batch-size-per-image 512 --nms-threshold 0.5` | 调整 ROI 采样及验证时的检测上限 |
+| `--rpn-batch-size-per-image`、`--rpn-positive-fraction`、`--rpn-nms-threshold`、`--rpn-pre-nms-topk-train`、`--rpn-post-nms-topk-train`、`--rpn-pre-nms-topk-test`、`--rpn-post-nms-topk-test`、`--small-object-anchors` | RPN anchor、采样、NMS 与候选框数量设置 | `--small-object-anchors --rpn-batch-size-per-image 256` | 更换 anchor 设置时检查 checkpoint 的 RPN 权重兼容性 |
+| `--augment`、`--augment-rotation`、`--rotation-range`、`--rotation-prob`、`--augment-translation`、`--translation-range`、`--translation-prob` | 总增强开关及旋转/平移增强范围与概率 | `--augment-rotation --rotation-range -5 5 --rotation-prob 0.5` | 按场景调整增强幅度及执行概率 |
+| `--augment-brightness`、`--brightness-range`、`--brightness-prob`、`--augment-contrast`、`--contrast-range`、`--contrast-prob`、`--augment-clahe`、`--clahe-clip-limit`、`--clahe-prob` | 亮度、对比度与 CLAHE 增强 | `--augment-brightness --brightness-range 0.85 1.15 --augment-clahe` | 依数据光照变化启用并调整范围/概率 |
+| `--augment-low-resolution`、`--low-resolution-scale`、`--low-resolution-prob`、`--augment-erasing`、`--erasing-prob`、`--erasing-smin`、`--erasing-smax` | 低分辨率与随机擦除增强 | `--augment-low-resolution --low-resolution-scale 0.6 --augment-erasing` | 模拟成像质量下降或局部遮挡 |
+| `--augment-copy-paste`、`--copy-paste-prob`、`--copy-paste-classes`、`--copy-paste-max-instances`、`--copy-paste-max-bbox-iou` | 从训练集粘贴实例的数据增强 | `--augment-copy-paste --copy-paste-prob 0.25 --copy-paste-classes class3` | 可限制来源类别、实例数和框重叠 |
+| `--focus-crop-class`、`--focus-crop-classes`、`--focus-crop-prob`、`--focus-crop-scale`、`--focus-crop-min-size` | 对指定类别启用目标聚焦裁剪 | `--focus-crop-classes class3 --focus-crop-prob 0.25 --focus-crop-scale 3` | 放大微小目标局部；选择单类别或类别列表 |
+| `--angle-head`、`--angle-classes`、`--angle-bins`、`--angle-period`、`--angle-loss-weight`、`--angle-lr-factor`、`--angle-label-source` | 可选角度预测头及监督配置 | `--angle-head --angle-classes class1 --angle-bins 72 --angle-period 360` | 默认关闭；监督源可选 `annotation/mask`，推理/导出须保持相同 head 配置 |
+| `--seed`、`--progress`、`--validate-only`、`--max-gpu-power-watts` | 随机种子、进度条、只校验模式及 GPU 功耗上限要求 | `--seed 42 --validate-only` | 只校验模式不训练；功耗要求需预先配置 NVIDIA 功耗限制 |
+| `--channels-last` | 预留的 channels-last 开关 | `--channels-last` | Detectron2 0.6 当前不支持启用该模式 |
+
+所有 `BooleanOptionalAction` 布尔参数均自动提供对应的 `--no-*` 关闭形式；`--resume` 和 `--validate-only` 等单向开关除外。
 
 ### 5.2 Ultralytics YOLO-seg 训练
 
@@ -326,11 +356,16 @@ python -m instance_segmentation.models.ultralytics_yolo.train \
 | `--data` | YOLO 数据集配置文件路径 | `--data /path/data.yaml` | **必选**。指定包含训练/验证路径与类别定义的 yaml |
 | `--model-id` | YOLO 系列代际架构 (CNN) | `--model-id yolov11` | 工业落地推荐 `yolov11`，亦兼容 `yolo26` 与 `yolov8` |
 | `--size` | 模型容量规格阶梯 | `--size small` | 端侧/嵌入式选 `nano/small`；高性能工作站选 `medium/large` |
-| `--epochs` / `--batch` | 训练总轮数与单批次样本数 | `--epochs 100 --batch 8` | 单阶段卷积架构推荐训练 `80 ~ 120` Epoch 充分拟合 |
+| `--weights` | 已有 Ultralytics `.pt` 权重 | `--weights /path/to/best.pt` | 用权重初始化新 run，不恢复优化器或 epoch；新 run 使用新的 `--project` / `--name`。模型规格及 `data.yaml` 类别名/顺序须核对 |
+| `--resume` | 恢复当前加载的训练 checkpoint | `--weights /path/to/last.pt --resume` | 用含 epoch/optimizer 状态的 `last.pt` 恢复；没有训练状态时框架警告并按权重初始化开始新 run |
+| `--epochs` / `--batch` (`--batch-size`) | 训练总轮数与单批次样本数 | `--epochs 100 --batch 8` | 单阶段卷积架构推荐训练 `80 ~ 120` Epoch 充分拟合 |
 | `--imgsz` | 训练输入方阵尺寸 | `--imgsz 640` | 默认 640，兼顾推理效率与掩膜边缘精细度 |
 | `--device` | 训练使用的 GPU 设备卡号 | `--device 0` | 单卡填 `0`，多卡填 `0,1`，无显卡设 `cpu` |
 | `--project` / `--name` | 训练输出项目目录与实验名称 | `--project output --name yolo11s` | 权重产物保存在 `output/yolo11s/weights/best.pt` |
 | `--amp` | 开启 FP16 自动混合精度训练 | `--amp` | 推荐开启，显著降低显存开销并提升训练吞吐 |
+| `--workers` | DataLoader worker 数 | `--workers 4` | 按 CPU 和存储吞吐调整；CLI 默认 4 |
+
+`--amp` 支持 `--no-amp`；`--resume` 是单向开关。恢复时应提供同一 run 的含训练状态 `last.pt`。
 
 ### 5.3 RF-DETR 训练
 
@@ -350,11 +385,16 @@ python -m instance_segmentation.models.rfdetr.train \
 |---|---|---|---|
 | `--data` | RF-DETR 数据集根目录 | `--data /path/rfdetr` | **必选**。内含 train 与 valid 目录及 `_annotations.coco.json` |
 | `--size` | Transformer 骨干与解码器尺寸 | `--size small` | 推荐 `small`，平衡实时推理帧率与复杂遮挡判别能力 |
+| `--weights` (`--pretrain-weights`) | RF-DETR `.pth` / `.pt` 初始化权重 | `--weights /path/to/checkpoint.pth` | 用权重初始化新 run，不恢复优化器或 epoch；使用新的 `--output-dir`，且 `--size`、分辨率和类别定义须匹配 |
+| `--resume` | 恢复指定 RF-DETR 训练 checkpoint | `--resume /path/to/checkpoint.pth` | 恢复训练状态；完整恢复需使用含优化器/调度器状态的 trainer checkpoint，EMA/best 权重文件不一定包含这些状态 |
 | `--resolution` | 模型多尺度输入方阵分辨率 | `--resolution 432` | 极速推理选 `432`（耗时仅 10ms）；追求极细小边缘选 `640` |
 | `--epochs` | 训练总轮数 (配合 EMA 权重保存) | `--epochs 50` | DETR 架构对遮挡残缺目标特征拟合推荐训练 `40 ~ 50` 轮 |
 | `--batch` / `--lr` | 批次大小与 AdamW 学习率 | `--batch 4 --lr 1e-4` | 显存 $\ge$ 8GB 推荐 batch=4，单卡基准学习率 `1e-4` |
 | `--output-dir` | 检查点与 EMA 最优权重输出目录 | `--output-dir output/rfdetr_small` | 产出供导出的 `checkpoint_best_ema.pth` |
 | `--devices` | 训练所占用的 GPU 设备数量 | `--devices 1` | 单卡设 `1`，多卡按实际物理卡数量传入 |
+| `--batch-size` | `--batch` 的别名 | `--batch-size 4` | 与 `--batch` 二选一设置批次大小 |
+| `--accelerator` | 训练加速设备 | `--accelerator cuda` | 支持 `auto/cuda/cpu` |
+| `--eval-interval` | 验证间隔（epoch） | `--eval-interval 1` | 默认每个 epoch 验证一次 |
 
 ---
 
